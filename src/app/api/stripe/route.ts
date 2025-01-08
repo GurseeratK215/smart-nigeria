@@ -1,63 +1,98 @@
-import { getAuthSession } from "@/lib/auth";
-import { prisma } from "@/lib/db";
-import { stripe } from "@/lib/stripe";
-import { NextResponse } from "next/server";
+// /api/stripe
 
-const settingsUrl = process.env.NEXTAUTH_URL + "/settings";
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import com.stripe.exception.StripeException;
+import com.stripe.model.billingportal.Session;
+import com.stripe.model.checkout.Session as CheckoutSession;
+import com.stripe.param.billingportal.SessionCreateParams;
+import com.stripe.param.checkout.SessionCreateParams.LineItem;
+import com.stripe.param.checkout.SessionCreateParams.SubscriptionData;
+import com.stripe.param.checkout.SessionCreateParams.PaymentMethodType;
 
-export async function GET() {
-  try {
-    const session = await getAuthSession();
-    if (!session?.user) {
-      return new NextResponse("unauthorised", { status: 401 });
+import java.util.Optional;
+
+@RestController
+@RequestMapping("/api/stripe")
+public class StripeController {
+
+    @Autowired
+    private AuthService authService;
+
+    @Autowired
+    private UserSubscriptionRepository userSubscriptionRepository;
+
+    @Value("${app.settings.url}")
+    private String settingsUrl;
+
+    @GetMapping
+    public ResponseEntity<?> handleSubscription() {
+        try {
+            // Verify session
+            Optional<User> userOpt = authService.getAuthenticatedUser();
+            if (userOpt.isEmpty()) {
+                return ResponseEntity.status(401).body("unauthorized");
+            }
+            User user = userOpt.get();
+
+            // Check for existing subscription
+            Optional<UserSubscription> subscriptionOpt = userSubscriptionRepository.findByUserId(user.getId());
+            if (subscriptionOpt.isPresent()) {
+                UserSubscription subscription = subscriptionOpt.get();
+
+                if (subscription.getStripeCustomerId() != null) {
+                    // Create Stripe billing portal session
+                    SessionCreateParams params = SessionCreateParams.builder()
+                            .setCustomer(subscription.getStripeCustomerId())
+                            .setReturnUrl(settingsUrl)
+                            .build();
+
+                    Session stripeSession = Session.create(params);
+                    return ResponseEntity.ok(Map.of("url", stripeSession.getUrl()));
+                }
+            }
+
+            // Create Stripe checkout session for new subscription
+            CheckoutSessionCreateParams sessionParams = CheckoutSessionCreateParams.builder()
+                    .setSuccessUrl(settingsUrl)
+                    .setCancelUrl(settingsUrl)
+                    .addPaymentMethodType(PaymentMethodType.CARD)
+                    .setMode(CheckoutSessionCreateParams.Mode.SUBSCRIPTION)
+                    .setBillingAddressCollection(CheckoutSessionCreateParams.BillingAddressCollection.AUTO)
+                    .setCustomerEmail(user.getEmail())
+                    .addLineItem(
+                            LineItem.builder()
+                                    .setPriceData(
+                                            LineItem.PriceData.builder()
+                                                    .setCurrency("usd")
+                                                    .setProductData(
+                                                            LineItem.PriceData.ProductData.builder()
+                                                                    .setName("Learning Journey Pro")
+                                                                    .setDescription("unlimited course generation!")
+                                                                    .build()
+                                                    )
+                                                    .setUnitAmount(2000L)
+                                                    .setRecurring(
+                                                            LineItem.PriceData.Recurring.builder()
+                                                                    .setInterval(Recurring.Interval.MONTH)
+                                                                    .build()
+                                                    )
+                                                    .build()
+                                    )
+                                    .setQuantity(1L)
+                                    .build()
+                    )
+                    .putMetadata("userId", user.getId())
+                    .build();
+
+            CheckoutSession stripeSession = CheckoutSession.create(sessionParams);
+            return ResponseEntity.ok(Map.of("url", stripeSession.getUrl()));
+
+        } catch (StripeException e) {
+            System.err.println("[STRIPE ERROR] " + e.getMessage());
+            return ResponseEntity.status(500).body("internal server error");
+        }
     }
-
-    const userSubscription = await prisma.userSubscription.findUnique({
-      where: {
-        userId: session.user.id,
-      },
-    });
-
-    // cancel at the billing portal
-    if (userSubscription && userSubscription.stripeCustomerId) {
-      const stripeSession = await stripe.billingPortal.sessions.create({
-        customer: userSubscription.stripeCustomerId,
-        return_url: settingsUrl,
-      });
-      return NextResponse.json({ url: stripeSession.url });
-    }
-
-    // user's first time subscribing
-    const stripeSession = await stripe.checkout.sessions.create({
-      success_url: settingsUrl,
-      cancel_url: settingsUrl,
-      payment_method_types: ["card"],
-      mode: "subscription",
-      billing_address_collection: "auto",
-      customer_email: session.user.email ?? "",
-      line_items: [
-        {
-          price_data: {
-            currency: "USD",
-            product_data: {
-              name: "Learning Journey Pro",
-              description: "unlimited course generation!",
-            },
-            unit_amount: 2000,
-            recurring: {
-              interval: "month",
-            },
-          },
-          quantity: 1,
-        },
-      ],
-      metadata: {
-        userId: session.user.id,
-      },
-    });
-    return NextResponse.json({ url: stripeSession.url });
-  } catch (error) {
-    console.log("[STRIPE ERROR]", error);
-    return new NextResponse("internal server error", { status: 500 });
-  }
 }
